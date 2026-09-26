@@ -322,5 +322,154 @@ class TestAPI(unittest.TestCase):
         )
 
 
+class TestReflowAPI(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.client = TestClient(app)
+
+    REFLOW_BODY = {
+        **BODY,
+        "min_duration_ms": 0,
+        "deletions": [[1400, 5200]],
+    }
+
+    def test_reflow_json(self):
+        r = self.client.post("/reflow", json=self.REFLOW_BODY)
+        self.assertEqual(r.status_code, 200, r.text)
+        data = r.json()
+        segs = data["segments"]
+        self.assertEqual(data["segment_count"], 2)
+        # middle words dropped; original request indices are preserved
+        self.assertEqual(segs[0]["word_start"], 0)
+        self.assertEqual(segs[0]["word_end"], 1)
+        self.assertEqual(segs[1]["word_start"], 7)
+        self.assertEqual(segs[1]["word_end"], 8)
+        # the second fragment is shifted earlier by 3800 ms
+        self.assertEqual(segs[0]["start_ms"], 0)
+        self.assertEqual(segs[0]["end_ms"], 1400)
+        self.assertEqual(segs[1]["start_ms"], 1400)
+        self.assertEqual(segs[1]["end_ms"], 2600)
+        # the two sides of the cut never share a subtitle
+        self.assertFalse(
+            any(s["word_start"] <= 1 and s["word_end"] >= 7 for s in segs)
+        )
+
+    def test_reflow_srt(self):
+        r = self.client.post("/reflow/srt", json=self.REFLOW_BODY)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.headers["content-type"].startswith("text/plain"))
+        srt = r.text
+        blocks = srt.strip().split("\n\n")
+        self.assertEqual(len(blocks), 2)
+        self.assertIn("00:00:00,000 --> 00:00:01,400", srt)
+        self.assertIn("00:00:01,400 --> 00:00:02,600", srt)
+        self.assertIn("Hello world.", srt)
+        self.assertIn("Fine thanks.", srt)
+
+    def test_reflow_srt_and_json_share_one_result(self):
+        rj = self.client.post("/reflow", json=self.REFLOW_BODY)
+        rs = self.client.post("/reflow/srt", json=self.REFLOW_BODY)
+        self.assertEqual(rj.status_code, 200)
+        self.assertEqual(rs.status_code, 200)
+        blocks = rs.text.strip().split("\n\n")
+        segs = rj.json()["segments"]
+        self.assertEqual(len(blocks), len(segs))
+        for k, (block, seg) in enumerate(zip(blocks, segs), start=1):
+            lines = block.split("\n")
+            self.assertEqual(lines[0], str(k))
+            self.assertIn(seg["text"], block)
+            self.assertIn(
+                f"{format_timestamp(seg['start_ms'])} --> "
+                f"{format_timestamp(seg['end_ms'])}",
+                lines[1],
+            )
+
+    def test_422_when_word_crosses_deletion_boundary(self):
+        # word 1 ("world.", 500..1400) is only partly covered.
+        body = {**self.REFLOW_BODY, "deletions": [[1000, 5200]]}
+        r = self.client.post("/reflow", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("intersects deletion range", r.json()["detail"])
+
+    def test_422_on_unsorted_deletions(self):
+        body = {**self.REFLOW_BODY, "deletions": [[5200, 5300], [1400, 1500]]}
+        r = self.client.post("/reflow", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("ascending", r.json()["detail"])
+
+    def test_422_on_overlapping_deletions(self):
+        body = {**self.REFLOW_BODY, "deletions": [[1400, 3000], [2500, 5200]]}
+        r = self.client.post("/reflow", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("overlap", r.json()["detail"])
+
+    def test_422_when_start_ge_end(self):
+        body = {**self.REFLOW_BODY, "deletions": [[1400, 1400]]}
+        r = self.client.post("/reflow", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("start_ms < end_ms", r.json()["detail"])
+
+    def test_422_when_all_words_deleted(self):
+        body = {**self.REFLOW_BODY, "deletions": [[0, 6400]]}
+        r = self.client.post("/reflow", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("every word", r.json()["detail"])
+
+    def test_422_when_fragment_has_no_legal_segmentation(self):
+        # Delete word 1 ("world.") and words 2..6 (the two ranges touch at
+        # 1400 and merge).  The first surviving fragment is then "Hello"
+        # alone at 500 ms, below the 1000 ms default minimum -> impossible.
+        body = {**BODY, "deletions": [[500, 1400], [1400, 5200]]}
+        r = self.client.post("/reflow", json=body)
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("no legal segmentation", r.json()["detail"])
+
+    def test_422_on_missing_deletions(self):
+        body = {k: v for k, v in self.REFLOW_BODY.items() if k != "deletions"}
+        r = self.client.post("/reflow", json=body)
+        self.assertEqual(r.status_code, 422)
+
+    def test_422_on_empty_deletions(self):
+        r = self.client.post(
+            "/reflow", json={**self.REFLOW_BODY, "deletions": []}
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_422_on_malformed_deletion_pair(self):
+        r = self.client.post(
+            "/reflow", json={**self.REFLOW_BODY, "deletions": [[1400]]}
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_422_on_negative_deletion_endpoint(self):
+        r = self.client.post(
+            "/reflow", json={**self.REFLOW_BODY, "deletions": [[-1, 5200]]}
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_max_line_chars_applies_to_reflow(self):
+        words = [
+            _word("aaa", 0, 450),
+            _word("bbb", 450, 900),
+            _word("ccc", 2000, 2450),
+            _word("ddd", 2450, 2900),
+        ]
+        body = {
+            "words": words,
+            "deletions": [[900, 2000]],
+            "max_chars": 42,
+            "min_duration_ms": 0,
+            "max_duration_ms": 7000,
+            "target_duration_ms": 2000,
+            "pause_threshold_ms": 500,
+            "max_line_chars": 7,
+        }
+        r = self.client.post("/reflow", json=body)
+        self.assertEqual(r.status_code, 200, r.text)
+        for s in r.json()["segments"]:
+            for line in s["text"].split("\n"):
+                self.assertLessEqual(len(line), 7)
+
+
 if __name__ == "__main__":
     unittest.main()

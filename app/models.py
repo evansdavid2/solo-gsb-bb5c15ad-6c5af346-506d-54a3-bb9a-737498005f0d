@@ -25,11 +25,9 @@ class Word(BaseModel):
         return self
 
 
-class SegmentRequest(BaseModel):
-    words: list[Word] = Field(
-        min_length=1,
-        description="time-ordered, non-overlapping word-level transcript",
-    )
+class _SegmentParams(BaseModel):
+    """Shared character / duration / typesetting parameters."""
+
     max_chars: int = Field(
         default=config.DEFAULT_MAX_CHARS,
         ge=1,
@@ -66,6 +64,19 @@ class SegmentRequest(BaseModel):
             "single-line output"
         ),
     )
+
+    @model_validator(mode="after")
+    def _check_limits(self) -> "_SegmentParams":
+        if self.max_duration_ms < self.min_duration_ms:
+            raise ValueError("max_duration_ms must be >= min_duration_ms")
+        return self
+
+
+class SegmentRequest(_SegmentParams):
+    words: list[Word] = Field(
+        min_length=1,
+        description="time-ordered, non-overlapping word-level transcript",
+    )
     required_break_after: list[WordIndex] | None = Field(
         default=None,
         description=(
@@ -87,11 +98,29 @@ class SegmentRequest(BaseModel):
         ),
     )
 
-    @model_validator(mode="after")
-    def _check_limits(self) -> "SegmentRequest":
-        if self.max_duration_ms < self.min_duration_ms:
-            raise ValueError("max_duration_ms must be >= min_duration_ms")
-        return self
+
+# Deletion endpoints are non-negative millisecond offsets on the original
+# video timeline; ordering / non-overlap / start < end checks live in the
+# reflow pipeline so both endpoints report them uniformly as 422.
+MsOffset = Annotated[int, Field(ge=0)]
+
+
+class ReflowRequest(_SegmentParams):
+    words: list[Word] = Field(
+        min_length=1,
+        description="time-ordered, non-overlapping word-level transcript",
+    )
+    deletions: list[tuple[MsOffset, MsOffset]] = Field(
+        min_length=1,
+        description=(
+            "deleted video spans as [start_ms, end_ms] pairs on the ORIGINAL "
+            "video timeline; they must be sorted ascending, be pairwise "
+            "non-overlapping (touching endpoints allowed) and satisfy "
+            "start_ms < end_ms. Words fully contained in a span are dropped; "
+            "a word intersecting a span boundary without being fully "
+            "contained yields 422."
+        ),
+    )
 
 
 class SegmentOut(BaseModel):

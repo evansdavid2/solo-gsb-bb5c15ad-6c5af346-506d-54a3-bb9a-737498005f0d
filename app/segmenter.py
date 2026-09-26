@@ -144,6 +144,52 @@ def _validate_manual_edits(
     return frozenset(required), tuple(ranges)
 
 
+def validate_words(
+    words: Sequence[WordLike],
+    *,
+    max_chars: int,
+    max_duration_ms: int,
+    max_line_chars: int | None = None,
+) -> None:
+    """Validate per-word limits and time ordering / non-overlap.
+
+    Raises :class:`SegmentationError` (HTTP 422) on the first violation.
+    Shared by the plain segmenter and the deletion-reflow pipeline so both
+    endpoints reject bad transcripts with identical messages.
+    """
+    for idx, w in enumerate(words):
+        if not w.text or not w.text.strip():
+            raise SegmentationError(f"word {idx} has empty text")
+        if w.end_ms <= w.start_ms:
+            raise SegmentationError(
+                f"word {idx} ({w.text!r}) must satisfy end_ms > start_ms "
+                f"(got {w.start_ms}..{w.end_ms})"
+            )
+        if len(w.text) > max_chars:
+            raise SegmentationError(
+                f"word {idx} ({w.text!r}) is {len(w.text)} characters and can "
+                f"never fit within max_chars={max_chars}"
+            )
+        if max_line_chars is not None and len(w.text) > max_line_chars:
+            raise SegmentationError(
+                f"word {idx} ({w.text!r}) is {len(w.text)} characters and can "
+                f"never fit within max_line_chars={max_line_chars}"
+            )
+        word_dur = w.end_ms - w.start_ms
+        if word_dur > max_duration_ms:
+            raise SegmentationError(
+                f"word {idx} ({w.text!r}) lasts {word_dur} ms and can never "
+                f"fit within max_duration_ms={max_duration_ms}"
+            )
+    for i in range(1, len(words)):
+        if words[i].start_ms < words[i - 1].end_ms:
+            raise SegmentationError(
+                f"words must be sorted by time and non-overlapping: word {i} "
+                f"starts at {words[i].start_ms} ms but word {i - 1} ends at "
+                f"{words[i - 1].end_ms} ms"
+            )
+
+
 @dataclass
 class SegmentResult:
     index: int
@@ -305,37 +351,12 @@ def segment_words(
             blocked_edge[k] = True
 
     # ---- input validation -------------------------------------------------
-    for idx, w in enumerate(words):
-        if not w.text or not w.text.strip():
-            raise SegmentationError(f"word {idx} has empty text")
-        if w.end_ms <= w.start_ms:
-            raise SegmentationError(
-                f"word {idx} ({w.text!r}) must satisfy end_ms > start_ms "
-                f"(got {w.start_ms}..{w.end_ms})"
-            )
-        if len(w.text) > max_chars:
-            raise SegmentationError(
-                f"word {idx} ({w.text!r}) is {len(w.text)} characters and can "
-                f"never fit within max_chars={max_chars}"
-            )
-        if max_line_chars is not None and len(w.text) > max_line_chars:
-            raise SegmentationError(
-                f"word {idx} ({w.text!r}) is {len(w.text)} characters and can "
-                f"never fit within max_line_chars={max_line_chars}"
-            )
-        word_dur = w.end_ms - w.start_ms
-        if word_dur > max_duration_ms:
-            raise SegmentationError(
-                f"word {idx} ({w.text!r}) lasts {word_dur} ms and can never "
-                f"fit within max_duration_ms={max_duration_ms}"
-            )
-    for i in range(1, n):
-        if words[i].start_ms < words[i - 1].end_ms:
-            raise SegmentationError(
-                f"words must be sorted by time and non-overlapping: word {i} "
-                f"starts at {words[i].start_ms} ms but word {i - 1} ends at "
-                f"{words[i - 1].end_ms} ms"
-            )
+    validate_words(
+        words,
+        max_chars=max_chars,
+        max_duration_ms=max_duration_ms,
+        max_line_chars=max_line_chars,
+    )
 
     # ---- natural break points between consecutive words -------------------
     natural = [False] * max(n - 1, 0)

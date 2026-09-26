@@ -1,6 +1,6 @@
 # 本地字幕切分 API（Python + FastAPI）
 
-接收**按时间排序、互不重叠的词级转写**（每个词含文字与起止毫秒），用**动态规划**寻找覆盖全部词、保持原有顺序的合法字幕切分，并支持 SRT 导出。
+接收**按时间排序、互不重叠的词级转写**（每个词含文字与起止毫秒），用**动态规划**寻找覆盖全部词、保持原有顺序的合法字幕切分，并支持 SRT 导出。另提供**视频删段后的字幕重排**接口（`/reflow`、`/reflow/srt`）：按原视频毫秒给出删除区间后，丢弃整段落在区间内的词、前移保留词时间，并在切口两侧强制分条后重新优化。
 
 - 优化目标（总代价）：
 
@@ -273,6 +273,108 @@ Fine thanks.
 
 ---
 
+## 视频删段后的字幕重排：`POST /reflow` 与 `POST /reflow/srt`
+
+在剪掉视频的若干时间段后重新生成字幕。请求在 `/segment` 的词级转写与全部切分参数（字数、时长、目标时长、停顿阈值、可选 `max_line_chars`）之外，额外接收一个字段：
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `deletions` | `[start_ms, end_ms]` 数组 | 必填（至少 1 段） | 以**原视频毫秒**计的删除区间，必须按时间升序、两两不重叠（端点相接允许，会自动合并）、且 `start_ms < end_ms` |
+
+处理规则：
+
+1. **丢词**：词的 `[start_ms, end_ms]` **完整落在**某个删除区间内（端点相等也算在内）则丢弃；词仅与删除边界**相交而未被完整覆盖**（音频被切掉一部分）时返回 `422`。端点恰好相接不算相交，例如词在 `1400` 结束、删除从 `1400` 开始，该词保留。
+2. **时间前移**：每个保留词的时间戳减去此前所有删除区间的累计时长，得到无空洞的新时间轴。
+3. **切口两侧必须分属不同字幕**：只要某删除区间位于两个相邻保留词之间，二者之间就强制存在一条字幕边缘。保留词据此切成若干**连续片段**，各片段独立调用现有字数 / 时长 / 双行排版优化器（片段之间不会合并成同一条字幕）。
+4. 任一片段不存在合法切分，或删除区间把**全部词都删光**，返回 `422`。
+
+输出中：
+
+- `word_start` / `word_end` 保留**原请求 `words` 的零基下标**（下标不因为丢词而重排）；
+- `start_ms` / `end_ms` / `duration_ms` 是**删段后的新时间轴**；
+- 各片段的优化代价相加得到 `total_cost`；SRT 同样使用新时间轴，序号跨片段连续编号。
+
+### `POST /reflow` —— JSON 重排
+
+对 9 个词的示例删除 `[1400, 5200]`（完整删掉 `How … today?` 五词所在的整段），可用 `examples/request_reflow.json` 复现：
+
+```bash
+curl -X POST http://localhost:8000/reflow \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_reflow.json
+```
+
+```json
+{
+  "segment_count": 2,
+  "total_cost": 5.8,
+  "segments": [
+    {
+      "index": 0,
+      "text": "Hello world.",
+      "start_ms": 0,
+      "end_ms": 1400,
+      "duration_ms": 1400,
+      "word_start": 0,
+      "word_end": 1,
+      "crossed_boundaries": 0
+    },
+    {
+      "index": 1,
+      "text": "Fine thanks.",
+      "start_ms": 1400,
+      "end_ms": 2600,
+      "duration_ms": 1200,
+      "word_start": 7,
+      "word_end": 8,
+      "crossed_boundaries": 0
+    }
+  ]
+}
+```
+
+注意第二条字幕的时间由原 `5200..6400` 前移 3800 ms（= 5200 − 1400）变为 `1400..2600`，而词下标仍是原请求中的 `7`、`8`。示例把 `min_duration_ms` 放宽为 `0`，因为删段后两侧片段更短。
+
+### `POST /reflow/srt` —— 同结果的 SRT 导出
+
+请求体与 `/reflow` 完全相同，返回与 JSON 同一份切分结果的 SRT 文档：
+
+```bash
+curl -X POST http://localhost:8000/reflow/srt \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_reflow.json
+```
+
+```srt
+1
+00:00:00,000 --> 00:00:01,400
+Hello world.
+
+2
+00:00:01,400 --> 00:00:02,600
+Fine thanks.
+```
+
+传入 `max_line_chars` 时每个片段同样按双行规则排版，SRT 块内用真实换行输出两行。
+
+### 删段接口的 `422`
+
+除与 `/segment` 相同的词级 / 参数 / 无合法切分错误外，`/reflow` 与 `/reflow/srt` 还会在以下情况返回 `422`：
+
+- 删除区间未按时间升序、两两重叠、或不满足 `start_ms < end_ms`（含负数端点、元素不是两个整数的二元组）；
+- 某个词与删除区间相交但未被完整覆盖（词跨在删除边界上），`detail` 会指出词下标与区间：
+
+  ```json
+  {"detail": "word 1 ('world.', 500..1400 ms) intersects deletion range [800, 2200] without being fully contained in it; word boundaries may not cross a deletion edge — extend the cut to a word boundary or adjust the range"}
+  ```
+
+- 删除区间把全部词都删光：`every word is fully contained in a deletion range; at least one word must survive ...`；
+- 切出的某个连续片段在给定字数 / 时长 / 行宽约束下没有合法切分（沿用 `no legal segmentation ...` 报错）。
+
+> 删除区间只落在两词间隙中时不丢词，但切口两侧仍强制断开，后续时间整体前移；删除区间完全落在全部词之外（在最后一个词之后等）则对结果没有影响。两个端点相接的删除区间（如 `[500,1000]` 与 `[1000,2000]`）会自动合并处理。
+
+---
+
 ## 错误处理（422）
 
 以下情况返回 HTTP `422`，响应体 `detail` 说明原因：
@@ -336,12 +438,13 @@ pytest
 ```
 app/
   config.py      # 环境变量默认值与罚分常量
-  models.py      # Pydantic 请求/响应模型
+  models.py      # Pydantic 请求/响应模型（/segment 与 /reflow 共享参数）
   segmenter.py   # 动态规划切分核心（纯 Python，无 Web 依赖）
+  reflow.py      # 删段重排核心：区间校验/丢词/时间前移/强制分片段
   srt.py         # SRT 时间戳与文档格式化
-  main.py        # FastAPI 入口（/segment、/segment/srt、/health）
+  main.py        # FastAPI 入口（/segment、/segment/srt、/reflow、/reflow/srt、/health）
 tests/           # unittest 测试（核心逻辑 + API 集成）
-examples/        # 请求示例（基础 / 双行排版 / 人工编辑边界）
+examples/        # 请求示例（基础 / 双行排版 / 人工编辑边界 / 删段重排）
 Dockerfile
 docker-compose.yml
 requirements.txt
