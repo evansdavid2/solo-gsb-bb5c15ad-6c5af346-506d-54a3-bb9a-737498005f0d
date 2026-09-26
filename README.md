@@ -1,6 +1,6 @@
 # 本地字幕切分 API（Python + FastAPI）
 
-接收**按时间排序、互不重叠的词级转写**（每个词含文字与起止毫秒），用**动态规划**寻找覆盖全部词、保持原有顺序的合法字幕切分，并支持 SRT 导出。
+接收**按时间排序、互不重叠的词级转写**（每个词含文字与起止毫秒），用**动态规划**寻找覆盖全部词、保持原有顺序的合法字幕切分，并支持 SRT 导出。另提供**视频删段重排**接口：给定原视频上的删除区间，丢弃被完整覆盖的词、将保留词按累计删除时长前移，再对各连续片段分别优化切分。
 
 - 优化目标（总代价）：
 
@@ -267,6 +267,86 @@ How are you doing today?
 Fine thanks.
 ```
 
+### `POST /segment/cut` —— 视频删段后的字幕重排（JSON）
+
+在 `/segment` 的基础上接收**按原视频毫秒计的删除区间**，先“剪掉”被删除的片段再重排字幕：
+
+- **删除区间校验**（违反任一规则返回 `422`）：`deletions` 至少含 1 个区间；每个区间为 `[start_ms, end_ms]` 且 `start_ms < end_ms`、均 ≥ 0；区间按起点**时间升序**给出、两两**互不重叠**（端点相接允许，如 `[2000, 3200]` 与 `[3200, 4600]`）；
+- **词的去留**：完整落在某个删除区间内的词被**丢弃**；词与删除边界相交但未被完整覆盖（被剪断、或仅被多个区间的并集覆盖）返回 `422`——删除边界不允许切穿任何一个词；与区间端点恰好相接的词不受影响；
+- **时间前移**：每个保留词的起止时间减去它之前所有删除区间的累计时长，得到剪后视频的新时间轴（片头删除会让整体提前，片尾删除不影响字幕）；
+- **分段切分**：删除区间两侧的词必须分属不同字幕，因此每个连续保留片段独立套用与 `/segment` 完全相同的字数、时长、双行排版规则与代价函数分别优化；`total_cost` 为各片段代价之和；
+- **下标**：响应中的 `word_start` / `word_end` 仍是**原请求** `words` 的零基下标（被删除的词不再出现，下标可能跳号）；`start_ms` / `end_ms` 为前移后的新时间；
+- **无解**：删除区间覆盖全部词（无词可排），或任一连续片段在现有限制下无合法切分，均返回 `422`（错误信息注明是第几个片段）。
+
+请求体在 `/segment` 字段（`words`、`max_chars`、`min_duration_ms`、`max_duration_ms`、`target_duration_ms`、`pause_threshold_ms`、可选 `max_line_chars`）之上增加：
+
+| 字段 | 类型 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `deletions` | `[start_ms, end_ms]` 数组 | 必填（至少 1 个） | 原视频时间轴上的删除区间（毫秒，≥ 0），按起点升序、互不重叠、`start_ms < end_ms` |
+
+> 该接口不接受 `required_break_after` / `keep_together`；删除区间本身即是最强的分段约束。无删除需求时请使用 `/segment`。
+
+请求示例（删除原视频 1.5s–5.0s，覆盖 `How are you doing today?` 四个词）：
+
+```bash
+curl -X POST http://localhost:8000/segment/cut \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_cut.json
+```
+
+响应示例（`200`）：
+
+```json
+{
+  "segment_count": 2,
+  "total_cost": 5.8,
+  "segments": [
+    {
+      "index": 0,
+      "text": "Hello world.",
+      "start_ms": 0,
+      "end_ms": 1400,
+      "duration_ms": 1400,
+      "word_start": 0,
+      "word_end": 1,
+      "crossed_boundaries": 0
+    },
+    {
+      "index": 1,
+      "text": "Fine thanks.",
+      "start_ms": 1700,
+      "end_ms": 2900,
+      "duration_ms": 1200,
+      "word_start": 7,
+      "word_end": 8,
+      "crossed_boundaries": 0
+    }
+  ]
+}
+```
+
+注意第二条字幕：`Fine` / `thanks.` 原时间为 5200–6400 ms，减去此前累计删除的 3500 ms 后前移到 1700–2900 ms；`word_start` 仍为原请求下标 `7`。
+
+### `POST /segment/cut/srt` —— 删段重排的 SRT 导出
+
+请求体与 `/segment/cut` 完全相同，返回同一份切分结果的 SRT 文档（`text/plain; charset=utf-8`）：
+
+```bash
+curl -X POST http://localhost:8000/segment/cut/srt \
+  -H 'Content-Type: application/json' \
+  -d @examples/request_cut.json
+```
+
+```srt
+1
+00:00:00,000 --> 00:00:01,400
+Hello world.
+
+2
+00:00:01,700 --> 00:00:02,900
+Fine thanks.
+```
+
 ### `GET /health`
 
 返回 `{"status":"ok"}`（容器健康检查同样使用该端点）。
@@ -286,6 +366,12 @@ Fine thanks.
   - `keep_together` 区间越界、`lo >= hi`（少于两个词）、或区间两两重叠；
   - 必断下标落在区间内部，或等于区间左外缘 `lo`（词 `lo` 既要结束上一条字幕、又要与词 `lo+1` 同条，互相矛盾）；落在右外缘 `hi` 合法；
 - 参数本身不合法（空词、`end_ms <= start_ms`、`max_duration_ms < min_duration_ms`、`max_line_chars < 1`、编辑字段元素不是非负整数 / 区间不是两个整数等）；
+- **删除区间相关（`/segment/cut`、`/segment/cut/srt`）**：
+  - `deletions` 缺失、为空数组、区间不是两个非负整数、`start_ms >= end_ms`；
+  - 区间未按起点升序给出，或两两重叠（端点相接允许）；
+  - 某个词与删除边界相交但未被完整覆盖（删除边界切穿了词）；
+  - 删除区间覆盖了全部词，没有任何词可排；
+  - 某个连续保留片段在现有字数 / 时长 / 行宽限制下无合法切分（错误信息注明片段序号）；
 - 没有任何切分能满足全部约束（例如最后一个词短于 `min_duration_ms`，或**人工边界迫使某条字幕违反时长 / 字数 / 行宽约束**，或传入 `max_line_chars` 后不存在满足行宽的双行排版）——会返回类似：
 
   ```json
@@ -306,7 +392,7 @@ Fine thanks.
 | `DEFAULT_TARGET_DURATION_MS` | `3000` | `target_duration_ms` |
 | `DEFAULT_PAUSE_THRESHOLD_MS` | `500` | `pause_threshold_ms` |
 
-`max_line_chars` 没有环境变量默认值：省略该请求字段即不启用双行排版，行为与旧版完全一致。`required_break_after`、`keep_together` 同样没有环境变量默认值：省略即不施加任何人工边界。
+`max_line_chars` 没有环境变量默认值：省略该请求字段即不启用双行排版，行为与旧版完全一致。`required_break_after`、`keep_together` 同样没有环境变量默认值：省略即不施加任何人工边界。`deletions` 为 `/segment/cut` 的必填字段，也没有环境变量默认值。
 
 不需要外部数据库或密钥，开箱即用。
 
@@ -338,10 +424,11 @@ app/
   config.py      # 环境变量默认值与罚分常量
   models.py      # Pydantic 请求/响应模型
   segmenter.py   # 动态规划切分核心（纯 Python，无 Web 依赖）
+  cut.py         # 视频删段后的重排：删词、时间前移、分片段切分
   srt.py         # SRT 时间戳与文档格式化
-  main.py        # FastAPI 入口（/segment、/segment/srt、/health）
-tests/           # unittest 测试（核心逻辑 + API 集成）
-examples/        # 请求示例（基础 / 双行排版 / 人工编辑边界）
+  main.py        # FastAPI 入口（/segment、/segment/srt、/segment/cut、/segment/cut/srt、/health）
+tests/           # unittest 测试（核心逻辑 + 删段重排 + API 集成）
+examples/        # 请求示例（基础 / 双行排版 / 人工编辑边界 / 删段重排）
 Dockerfile
 docker-compose.yml
 requirements.txt
@@ -368,3 +455,5 @@ dp[i] = 按 (总代价, 字幕条数) 字典序取最小，枚举合法的字幕
 下标越界、区间少于两个词、区间重叠、必断与区间冲突等输入错误在进入 DP 前一次性校验并返回 `422`；DP 跑完若 `dp[0]` 不可达，即说明人工边界（或行宽等其他约束）导致无合法方案。人工边界只增减可行候选，枚举仍覆盖所有合法切分，因此求出的仍是满足全部边界的**全局**最低代价方案，时间复杂度保持 O(n² log n)（不传 `max_line_chars` 时 O(n²)）。
 
 传入 `max_line_chars` 时，`linecost(i,j)` 为该候选字幕的排版代价：整段不超行宽则为 0（单行）；否则在词间枚举断点，两行各自不超行宽时计算 `(行长1 − 行长2)² / 行宽²`，取最小值（平局取靠前断点）；没有合法断点时该候选非法。行长用“词长 + 词间空格”的前缀和按二分搜索求值，合法断点范围与等长断点都只需 O(log n) 定位，因此整体时间复杂度仍为 O(n² log n)（不传该参数时为 O(n²)），空间 O(n)。
+
+删段重排在进入 DP 之前做一次线性扫描：删除区间先校验升序、不重叠、`start < end`；随后按时间顺序遍历词，用指针推进区间——完整落入区间的词丢弃，与边界相交但未完整覆盖的词直接报错，保留词减去此前累计删除时长；凡是跨过删除区间的位置都开启新的连续片段。由于每个删除区间强制成为字幕边缘，总代价与硬约束都按字幕可加，因此各片段独立跑一次上述 DP 即等价于全局强制断点后的最优解；各片段的字幕顺序拼接、统一编号，`word_start` / `word_end` 映射回原请求下标。

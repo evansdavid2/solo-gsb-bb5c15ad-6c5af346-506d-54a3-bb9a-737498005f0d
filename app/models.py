@@ -12,6 +12,9 @@ from . import config
 # live in the segmenter, so both endpoints report them uniformly as 422).
 WordIndex = Annotated[int, Field(ge=0)]
 
+# Non-negative millisecond timestamp on the original video timeline.
+Ms = Annotated[int, Field(ge=0)]
+
 
 class Word(BaseModel):
     text: str = Field(min_length=1, description="token text")
@@ -25,7 +28,9 @@ class Word(BaseModel):
         return self
 
 
-class SegmentRequest(BaseModel):
+class BaseSegmentRequest(BaseModel):
+    """Fields shared by the plain and the cut-aware segmentation requests."""
+
     words: list[Word] = Field(
         min_length=1,
         description="time-ordered, non-overlapping word-level transcript",
@@ -66,6 +71,15 @@ class SegmentRequest(BaseModel):
             "single-line output"
         ),
     )
+
+    @model_validator(mode="after")
+    def _check_limits(self) -> "BaseSegmentRequest":
+        if self.max_duration_ms < self.min_duration_ms:
+            raise ValueError("max_duration_ms must be >= min_duration_ms")
+        return self
+
+
+class SegmentRequest(BaseSegmentRequest):
     required_break_after: list[WordIndex] | None = Field(
         default=None,
         description=(
@@ -87,11 +101,22 @@ class SegmentRequest(BaseModel):
         ),
     )
 
-    @model_validator(mode="after")
-    def _check_limits(self) -> "SegmentRequest":
-        if self.max_duration_ms < self.min_duration_ms:
-            raise ValueError("max_duration_ms must be >= min_duration_ms")
-        return self
+
+class CutRequest(BaseSegmentRequest):
+    deletions: list[tuple[Ms, Ms]] = Field(
+        min_length=1,
+        description=(
+            "deletion intervals [start_ms, end_ms] on the original video "
+            "timeline, in milliseconds; they must be sorted by start time, "
+            "pairwise non-overlapping (touching at an endpoint is allowed) "
+            "and each must satisfy start_ms < end_ms. Words fully covered "
+            "by an interval are dropped; a word that intersects an interval "
+            "boundary without being fully covered is rejected (422). The "
+            "surviving words are shifted earlier by the total deleted "
+            "duration before them, and words on opposite sides of a "
+            "deletion never share a subtitle"
+        ),
+    )
 
 
 class SegmentOut(BaseModel):
